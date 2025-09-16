@@ -1,0 +1,6 @@
+*.log
+*.out
+*.class
+target/
+work/
+temp/
