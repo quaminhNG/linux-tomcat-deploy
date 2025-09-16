@@ -1,0 +1,274 @@
+Ghi chú cài đặt Apache Tomcat trên Linux (Ubuntu/Debian)
+
+  Mục tiêu: Cài Tomcat 9 bằng tarball (thủ công), chạy như systemd
+  service, và deploy trang JSP test / file WAR.
+  Ưu tiên hiểu bản chất: quyền, đường dẫn, service, log, firewall.
+
+0) Yêu cầu & khái niệm nhanh
+
+-   Tomcat là Java Web Container chạy JSP/Servlet (khác với Nginx/Apache
+    HTTPD).
+-   Mặc định lắng nghe cổng 8080.
+-   Ứng dụng được deploy dưới dạng:
+    -   Thư mục có index.jsp, WEB-INF/… bên trong webapps/.
+    -   WAR (ví dụ myapp.war) đặt vào webapps/ → Tomcat tự bung.
+-   Không chạy Tomcat bằng root → tạo user riêng để an toàn.
+
+------------------------------------------------------------------------
+
+1) Cài Java JDK 17 & lấy JAVA_HOME
+
+    sudo apt update
+    sudo apt install -y openjdk-17-jdk
+    java -version
+
+Giải thích - apt update: cập nhật danh sách gói.
+- apt install: cài JDK 17 (Tomcat chạy trên JVM).
+- java -version: xác nhận Java đã cài.
+
+Lấy JAVA_HOME tự động (để cấu hình service)
+
+    readlink -f "$(which java)"             # → /usr/lib/jvm/.../bin/java
+    dirname "$(dirname "$(readlink -f "$(which java)")")"
+
+  Ghi lại kết quả (ví dụ: /usr/lib/jvm/java-17-openjdk-amd64).
+
+------------------------------------------------------------------------
+
+2) Tạo user & thư mục cài Tomcat
+
+    sudo useradd -m -U -d /opt/tomcat -s /bin/false tomcat
+
+Giải thích - -m: tạo thư mục home.
+- -U: tạo group cùng tên.
+- -d /opt/tomcat: đặt home/đường cài.
+- -s /bin/false: chặn đăng nhập shell.
+→ Chạy dịch vụ bằng user riêng tomcat an toàn hơn.
+
+------------------------------------------------------------------------
+
+3) Tải & giải nén Tomcat vào đúng chỗ
+
+    TOMCAT_VER=9.0.91
+    cd /tmp
+    wget "https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VER}/bin/apache-tomcat-${TOMCAT_VER}.tar.gz"
+    sudo mkdir -p /opt/tomcat
+    sudo tar -xzf "apache-tomcat-${TOMCAT_VER}.tar.gz" -C /opt/tomcat --strip-components=1
+
+Giải thích - Tải bản 9.0.91 (ổn định).
+- --strip-components=1: bỏ lớp thư mục gốc khi giải nén, để nội dung nằm
+trực tiếp trong /opt/tomcat.
+
+Phân quyền & cấp quyền chạy script
+
+    sudo chown -R tomcat:tomcat /opt/tomcat
+    # Dùng sh -c để wildcard *.sh được mở rộng trong ngữ cảnh root:
+    sudo sh -c 'chmod +x /opt/tomcat/bin/*.sh'
+
+Kiểm tra cấu trúc thư mục
+
+    sudo ls -l /opt/tomcat
+    # Kỳ vọng: bin/ conf/ lib/ logs/ temp/ webapps/ work/ ...
+
+------------------------------------------------------------------------
+
+4) Chạy thử thủ công để “cảm” cơ chế
+
+    sudo -u tomcat /opt/tomcat/bin/startup.sh
+    sudo tail -n 100 /opt/tomcat/logs/catalina.out
+
+Giải thích - sudo -u tomcat: chạy dưới user tomcat.
+- catalina.out: log chính.
+- Kỳ vọng thấy: Server startup in ... ms.
+
+Dừng thử
+
+    sudo -u tomcat /opt/tomcat/bin/shutdown.sh
+
+Kiểm tra cổng 8080 & HTTP
+
+    sudo ss -ltnp | grep 8080      # thấy java lắng nghe cổng 8080
+    curl -I http://localhost:8080/ # trả 200/302/403 là OK
+
+------------------------------------------------------------------------
+
+5) Tạo systemd service (chạy nền, tự start khi boot)
+
+Tạo file:
+
+    sudo nano /etc/systemd/system/tomcat.service
+
+Dán nội dung (sửa JAVA_HOME= theo máy bạn nếu khác):
+
+    [Unit]
+    Description=Apache Tomcat
+    After=network.target
+
+    [Service]
+    Type=forking
+    User=tomcat
+    Group=tomcat
+    Environment="JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+    Environment="CATALINA_HOME=/opt/tomcat"
+    Environment="CATALINA_BASE=/opt/tomcat"
+    Environment="CATALINA_PID=/opt/tomcat/temp/tomcat.pid"
+    Environment="CATALINA_OPTS=-Xms256M -Xmx512M -server -XX:+UseG1GC"
+    ExecStart=/opt/tomcat/bin/startup.sh
+    ExecStop=/opt/tomcat/bin/shutdown.sh
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+
+Giải thích các trường chính - Type=forking: script startup tạo tiến
+trình nền.
+- User/Group: chạy với tomcat.
+- Environment=: đặt biến môi trường (đặc biệt JAVA_HOME).
+- ExecStart/ExecStop: lệnh khởi động/dừng.
+- Restart=on-failure: tự khởi động lại khi lỗi.
+- WantedBy=multi-user.target: cho phép enable service khi boot.
+
+Nạp & chạy
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable tomcat
+    sudo systemctl start tomcat
+    sudo systemctl status tomcat
+
+------------------------------------------------------------------------
+
+6) Mở firewall (nếu dùng UFW)
+
+    sudo ufw allow 8080/tcp
+    sudo ufw status
+
+------------------------------------------------------------------------
+
+7) Deploy app thử: thư mục hello (không cần WAR)
+
+    # Tạo thư mục app
+    sudo -u tomcat mkdir -p /opt/tomcat/webapps/hello
+
+    # Tạo JSP đơn giản
+    sudo -u tomcat tee /opt/tomcat/webapps/hello/index.jsp >/dev/null <<'EOF'
+    <%@ page contentType="text/html; charset=UTF-8" %>
+    <html><body style="font-family:sans-serif">
+      <h1>Hello from Tomcat!</h1>
+      <p>Server time: <%= new java.util.Date() %></p>
+    </body></html>
+    EOF
+
+Giải thích - Tomcat tự deploy mọi thư mục/WAR trong webapps/.
+- Dùng sudo -u tomcat để file thuộc user tomcat.
+
+Reload & kiểm tra
+
+    sudo systemctl restart tomcat
+    curl http://localhost:8080/hello/
+
+------------------------------------------------------------------------
+
+8) Deploy app thật: file WAR
+
+    # Ví dụ WAR nằm ở /home/ubuntu/myapp.war
+    sudo cp /home/ubuntu/myapp.war /opt/tomcat/webapps/
+    sudo chown tomcat:tomcat /opt/tomcat/webapps/myapp.war
+
+    # Theo dõi quá trình bung WAR
+    sudo tail -f /opt/tomcat/logs/catalina.out
+
+Giải thích - myapp.war → Tomcat bung thành thư mục myapp/.
+- Truy cập http://<IP>:8080/myapp/.
+- Muốn chạy ở root /: đặt tên file là ROOT.war.
+
+------------------------------------------------------------------------
+
+9) Kiểm tra & khắc phục lỗi nhanh
+
+9.1 Không đọc được log (Permission denied)
+
+-   Đọc bằng sudo:
+
+        sudo tail -n 100 /opt/tomcat/logs/catalina.out
+
+-   Hoặc cho user hiện tại vào group tomcat (tùy chọn):
+
+        sudo usermod -aG tomcat $USER
+        sudo chmod -R g+rx /opt/tomcat/logs
+
+9.2 404 khi truy cập /hello/
+
+-   Đảm bảo thư mục: /opt/tomcat/webapps/hello/index.jsp
+
+-   Kiểm tra log:
+
+        sudo tail -n 200 /opt/tomcat/logs/catalina.out
+
+-   Kiểm tra Host có bật auto-deploy:
+
+        sudo grep -n '<Host ' /opt/tomcat/conf/server.xml
+
+9.3 Service không start / lỗi JAVA_HOME
+
+    sudo systemctl status tomcat
+    sudo journalctl -u tomcat -e
+
+9.4 Cổng 8080 đang bận
+
+    sudo lsof -i :8080
+
+------------------------------------------------------------------------
+
+10) Tuỳ chọn: Manager GUI (có bảo vệ IP)
+
+Tạo user/role
+
+    sudo nano /opt/tomcat/conf/tomcat-users.xml
+
+Giới hạn IP truy cập Manager (khuyến nghị)
+
+    sudo nano /opt/tomcat/webapps/manager/META-INF/context.xml
+
+------------------------------------------------------------------------
+
+11) Tuỳ chọn: setenv.sh & biến môi trường app
+
+    sudo -u tomcat tee /opt/tomcat/bin/setenv.sh >/dev/null <<'EOF'
+    export JAVA_OPTS="$JAVA_OPTS -Dspring.profiles.active=prod -DDB_URL=jdbc:mysql://127.0.0.1:3306/app"
+    EOF
+    sudo chmod +x /opt/tomcat/bin/setenv.sh
+    sudo systemctl restart tomcat
+
+------------------------------------------------------------------------
+
+12) Tuỳ chọn: Reverse Proxy bằng Nginx + SSL
+
+    sudo apt install -y nginx
+    sudo tee /etc/nginx/sites-available/myapp.conf >/dev/null <<'EOF'
+    server {
+        listen 80;
+        server_name your-domain.com;
+        location / {
+            proxy_pass http://127.0.0.1:8080/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+    EOF
+    sudo ln -s /etc/nginx/sites-available/myapp.conf /etc/nginx/sites-enabled/
+    sudo nginx -t && sudo systemctl reload nginx
+
+------------------------------------------------------------------------
+
+Phụ lục: Ghi nhớ nhanh cú pháp & mẹo
+
+-   sudo sh -c 'CMD *.sh': chạy cả câu lệnh trong shell root để wildcard
+    *.sh được mở rộng (tránh lỗi quyền).
+-   sudo -u tomcat ...: chạy lệnh với tư cách user tomcat.
+-   tail -f file.log: xem log theo thời gian thực.
+-   systemctl {start|stop|restart|status} tomcat: quản trị service
+    chuẩn.
+-   unpackWARs/autoDeploy/deployOnStartup: bật auto bung WAR/auto deploy
+    thư mục trong webapps/.
